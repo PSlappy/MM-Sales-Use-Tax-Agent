@@ -46,7 +46,11 @@ MICROMART_LOGIN_FRAGMENT = "auth.micromart.com"
 TAX_REPORT_TARGET_DIR = Path.home() / "Desktop" / "Access-Amenities" / "Financials" / "Monthly-Sales-and-Use-Tax"
 DRIVE_FOLDER_ID_FILE = ROOT / "config" / "drive-folder-id.txt"
 DRIVE_OAUTH_CLIENT_FILE = ROOT / "config" / "oauth-client.json"
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+TAX_REGION_TOTALS_SHEET_TITLE = "Tax-Region-Totals"
 KEYCHAIN_DRIVE_REFRESH = "tax-agent-drive-oauth-refresh-token"
 
 MAX_LOGIN_ATTEMPTS = 2  # capped low deliberately -- avoid tripping account lockouts
@@ -103,10 +107,9 @@ def get_keychain_secret(service: str, setup_hint: str = "config/keychain-setup.m
     return result.stdout.strip()
 
 
-def _drive_service():
+def _google_creds():
     import json
     from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
 
     if not DRIVE_OAUTH_CLIENT_FILE.exists():
         raise StepFailed(
@@ -116,7 +119,7 @@ def _drive_service():
     refresh_token = get_keychain_secret(
         KEYCHAIN_DRIVE_REFRESH, setup_hint="src/authorize_drive.py (run it once)"
     )
-    creds = Credentials(
+    return Credentials(
         token=None,
         refresh_token=refresh_token,
         token_uri=client_config["token_uri"],
@@ -124,7 +127,18 @@ def _drive_service():
         client_secret=client_config["client_secret"],
         scopes=DRIVE_SCOPES,
     )
-    return build("drive", "v3", credentials=creds)
+
+
+def _drive_service():
+    from googleapiclient.discovery import build
+
+    return build("drive", "v3", credentials=_google_creds())
+
+
+def _sheets_service():
+    from googleapiclient.discovery import build
+
+    return build("sheets", "v4", credentials=_google_creds())
 
 
 class Context:
@@ -559,6 +573,13 @@ def step_summarize_tax_by_region(ctx: Context) -> None:
 
 
 def step_upload_tax_report_to_drive(ctx: Context) -> None:
+    """Uploads the downloaded CSV as a Google Sheet (not a flat file) so it can
+    be opened and checked manually in Drive: one tab with the raw MicroMart
+    export, and a second "Tax-Region-Totals" tab holding a single QUERY
+    formula that sums Sales (pre-tax)/Tax Collected/Total (tax included) per
+    Tax Region straight from the first tab -- it recalculates on its own if
+    the raw data ever changes and needs no maintenance as more regions get
+    added."""
     from googleapiclient.http import MediaFileUpload
 
     log = ctx.log
@@ -576,13 +597,59 @@ def step_upload_tax_report_to_drive(ctx: Context) -> None:
         )
     folder_id = DRIVE_FOLDER_ID_FILE.read_text().strip()
 
-    service = _drive_service()
-    file_metadata = {"name": file_path.name, "parents": [folder_id]}
+    drive = _drive_service()
+    # Setting the target mimeType to Sheets while uploading a CSV converts it
+    # on import, rather than uploading a flat file and converting separately.
+    file_metadata = {
+        "name": file_path.stem,
+        "parents": [folder_id],
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
     media = MediaFileUpload(str(file_path), mimetype="text/csv")
-    service.files().create(
+    result = drive.files().create(
         body=file_metadata, media_body=media, fields="id", supportsAllDrives=True,
     ).execute()
-    log.info("Uploaded %s to Drive folder %s", file_path.name, folder_id)
+    spreadsheet_id = result["id"]
+    log.info("Uploaded %s as Google Sheet %s in Drive folder %s", file_path.name, spreadsheet_id, folder_id)
+
+    sheets = _sheets_service()
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    data_sheet = meta["sheets"][0]["properties"]
+    data_sheet_id = data_sheet["sheetId"]
+    data_sheet_title = "Tax Report"
+
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": data_sheet_id, "title": data_sheet_title},
+                        "fields": "title",
+                    }
+                },
+                {"addSheet": {"properties": {"title": TAX_REGION_TOTALS_SHEET_TITLE}}},
+            ]
+        },
+    ).execute()
+
+    # Column letters match the source CSV: A=Tax Region, F=Sales (pre-tax),
+    # G=Tax Collected, H=Total (tax included). One QUERY formula covers any
+    # number of Tax Regions the data grows to, so it needs no code change or
+    # manual upkeep as more locations are added.
+    formula = (
+        f"=QUERY('{data_sheet_title}'!A2:H, "
+        '"select A, sum(F), sum(G), sum(H) where A is not null group by A '
+        "label A 'Tax Region', sum(F) 'Sales (pre-tax)', sum(G) 'Tax Collected', "
+        "sum(H) 'Total (tax included)'\", 0)"
+    )
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{TAX_REGION_TOTALS_SHEET_TITLE}'!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[formula]]},
+    ).execute()
+    log.info("Added '%s' formula tab to the Sheet", TAX_REGION_TOTALS_SHEET_TITLE)
 
 
 STEPS = [

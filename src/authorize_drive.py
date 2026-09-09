@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-time interactive Google OAuth consent for Drive access.
+One-time interactive Google OAuth consent for Drive + Sheets access.
 
 Run this once (and again any time scopes change, or if the refresh token is
 ever revoked):
@@ -10,6 +10,11 @@ ever revoked):
 Opens a browser window. Sign in as info@accessamenities.com and approve
 access. The resulting refresh token is stored in Keychain -- the sync script
 reads it from there and never needs the browser again.
+
+Needs both drive.file (create/place the file in the target Drive folder) and
+spreadsheets (write the "Tax-Region-Totals" formula tab via the Sheets API)
+-- drive.file alone doesn't cover Sheets API calls even on files this app
+created itself.
 
 See docs/google-drive-oauth-setup.md for how config/oauth-client.json is
 obtained (a separate OAuth Client from the sibling micromart-vendsoft-sync
@@ -23,7 +28,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 ROOT = Path(__file__).resolve().parent.parent
 CLIENT_SECRETS_FILE = ROOT / "config" / "oauth-client.json"
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 KEYCHAIN_SERVICE = "tax-agent-drive-oauth-refresh-token"
 
 
