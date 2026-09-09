@@ -8,6 +8,7 @@ __pycache__/
 *oauth-client*.json
 *client_secret*.json
 config/*token*.json
+config/drive-folder-id.txt
 logs/*.log
 browser-state/
 debug-screenshots/

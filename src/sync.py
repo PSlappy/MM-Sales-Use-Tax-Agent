@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Monthly Sales & Use Tax Agent -- MicroMart login foundation.
+Monthly Sales & Use Tax Agent.
 
 Shares its MicroMart login logic (including TOTP-based MFA and headless-to-headed
 escalation) with the sibling MicroMart -> VendSoft Sales Reconciliation Agent tool,
 extracted verbatim since both automate logging into the same MicroMart account. See
-CLAUDE.md for the full story -- this file currently stops right after a successful
-login. Add your own steps below the `micromart_login` step in STEPS.
+CLAUDE.md for the full story. After login, downloads the previous month's Tax
+Report ("Tax Breakdown" pivot export) from MicroMart Analytics, saves it under
+~/Desktop/Access-Amenities/Financials/Monthly-Sales-and-Use-Tax, and uploads it to
+the same folder in Google Drive.
 
 Manual run:       .venv/bin/python src/sync.py
-Resume a step:    .venv/bin/python src/sync.py --resume-from micromart_login
+Resume a step:    .venv/bin/python src/sync.py --resume-from download_tax_report
 """
 import argparse
 import logging
@@ -18,7 +20,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -34,7 +36,14 @@ DEBUG_DIR = ROOT / "debug-screenshots"
 
 MICROMART_BASE = "https://platform.micromart.com"
 MICROMART_DASHBOARD = f"{MICROMART_BASE}/dashboard"
+MICROMART_TAX_REPORT = f"{MICROMART_BASE}/dashboard/analytics/tax-report"
 MICROMART_LOGIN_FRAGMENT = "auth.micromart.com"
+
+TAX_REPORT_TARGET_DIR = Path.home() / "Desktop" / "Access-Amenities" / "Financials" / "Monthly-Sales-and-Use-Tax"
+DRIVE_FOLDER_ID_FILE = ROOT / "config" / "drive-folder-id.txt"
+DRIVE_OAUTH_CLIENT_FILE = ROOT / "config" / "oauth-client.json"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+KEYCHAIN_DRIVE_REFRESH = "tax-agent-drive-oauth-refresh-token"
 
 MAX_LOGIN_ATTEMPTS = 2  # capped low deliberately -- avoid tripping account lockouts
 
@@ -88,6 +97,30 @@ def get_keychain_secret(service: str, setup_hint: str = "config/keychain-setup.m
     if result.returncode != 0:
         raise StepFailed(f"Could not read '{service}' from Keychain. See {setup_hint}.")
     return result.stdout.strip()
+
+
+def _drive_service():
+    import json
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    if not DRIVE_OAUTH_CLIENT_FILE.exists():
+        raise StepFailed(
+            f"Missing {DRIVE_OAUTH_CLIENT_FILE}. See docs/google-drive-oauth-setup.md."
+        )
+    client_config = json.loads(DRIVE_OAUTH_CLIENT_FILE.read_text())["installed"]
+    refresh_token = get_keychain_secret(
+        KEYCHAIN_DRIVE_REFRESH, setup_hint="src/authorize_drive.py (run it once)"
+    )
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri=client_config["token_uri"],
+        client_id=client_config["client_id"],
+        client_secret=client_config["client_secret"],
+        scopes=DRIVE_SCOPES,
+    )
+    return build("drive", "v3", credentials=creds)
 
 
 class Context:
@@ -309,16 +342,172 @@ def step_micromart_login(ctx: Context) -> None:
     )
 
 
-# TODO: add your next step(s) here, e.g.:
-#
-# def step_download_monthly_report(ctx: Context) -> None:
-#     page = ctx.micromart_page()
-#     ...
-#
-# and append it to STEPS below.
+def _dismiss_hubspot_popup(page, log: logging.Logger) -> None:
+    """MicroMart embeds HubSpot 'Web Interactives' marketing popups that can overlay
+    the page and intercept clicks -- confirmed live on the Tax Report page, same as
+    the sibling tool hit on its transactions page. Not part of the app itself, just
+    clear it out of the way. Don't call this once a MicroMart menu/panel of our own
+    is open -- the Escape key press closes those too (confirmed live: it silently
+    dismissed the Download-data panel before it could be interacted with)."""
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        removed = page.evaluate(
+            """() => {
+                const selectors = [
+                    '#hs-interactives-modal-overlay',
+                    '#hs-web-interactives-top-anchor',
+                    'iframe[title="Popup CTA"]',
+                ];
+                let count = 0;
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach((el) => { el.remove(); count++; });
+                }
+                return count;
+            }"""
+        )
+        if removed:
+            log.info("Removed %d HubSpot popup element(s)", removed)
+    except Exception:
+        pass
+
+
+def _previous_month_period(today: date) -> date:
+    """The tax period a report run on `today` should cover -- the prior calendar
+    month, not the month the script happens to run in (this tool is scheduled for
+    the 1st of the month, pulling the just-completed month's data)."""
+    first_of_this_month = today.replace(day=1)
+    return first_of_this_month - timedelta(days=1)
+
+
+def _tax_report_filename(period: date) -> str:
+    return f"tax-report-summary-{period.strftime('%m-%Y')}.csv"
+
+
+def step_download_tax_report(ctx: Context) -> None:
+    page = ctx.micromart_page()
+    log = ctx.log
+
+    _goto(page, MICROMART_TAX_REPORT)
+    page.wait_for_selector("button[aria-label='Date']", timeout=90000, state="visible")
+    _dismiss_hubspot_popup(page, log)
+
+    # The default filter on page load is "Previous 30 days or today" -- clear it
+    # first so the Date button reopens the full preset menu (Today/.../Previous
+    # month/...) rather than the narrower relative-range editor for the current
+    # filter type. Confirmed live: skipping the clear opens the wrong picker.
+    filters = page.get_by_test_id("fixed-width-filters")
+    clear_btn = filters.get_by_role("button", name="Clear")
+    if clear_btn.count() > 0:
+        clear_btn.first.click()
+        page.wait_for_timeout(500)
+
+    date_btn = filters.get_by_role("button", name="Date")
+    date_btn.click()
+    page.wait_for_timeout(500)
+    controls_id = date_btn.get_attribute("aria-controls")
+    if not controls_id:
+        raise StepFailed("Tax Report: date filter dropdown did not open as expected.")
+    page.locator(f"#{controls_id}").get_by_text("Previous month", exact=True).first.click()
+    log.info("Tax Report: date filter set to Previous month")
+
+    pivot = page.locator("[data-testid='visualization-root'][data-viz-ui-name='Pivot Table']")
+    try:
+        pivot.wait_for(state="visible", timeout=90000)
+    except PlaywrightTimeoutError:
+        raise StepFailed("Tax Report: the Tax Breakdown pivot table card never appeared.")
+    dashcard = page.locator("[data-testid='dashcard']").filter(has=pivot)
+    dashcard.scroll_into_view_if_needed()
+
+    # The underlying analytics query is slow and varies a lot -- confirmed live
+    # anywhere from ~15s to ~3min for the same report. Poll for real content
+    # rather than a fixed sleep.
+    log.info("Tax Report: waiting for Tax Breakdown data to finish loading (up to 5 min)...")
+    for _ in range(150):
+        if "%" in pivot.inner_text() and len(pivot.inner_text()) > 50:
+            break
+        page.wait_for_timeout(2000)
+    else:
+        raise StepFailed("Tax Report: Tax Breakdown data never finished loading after 5 minutes.")
+
+    DEBUG_DIR.mkdir(exist_ok=True)
+    page.screenshot(path=str(DEBUG_DIR / "tax-report-breakdown-loaded.png"))
+
+    # The card's "..." action menu only renders once the card is hovered.
+    dashcard.hover()
+    page.wait_for_timeout(300)
+    ellipsis = dashcard.locator("[data-testid='public-or-embedded-dashcard-menu']")
+    ellipsis.click()
+    page.wait_for_timeout(400)
+
+    menu = page.locator("[role='menu']")
+    if menu.count() == 0:
+        raise StepFailed("Tax Report: the Tax Breakdown '...' menu did not open.")
+    menu.first.locator("[role='menuitem']").filter(has_text="Download results").first.click()
+
+    try:
+        page.wait_for_selector("text=Download data", timeout=10000)
+    except PlaywrightTimeoutError:
+        raise StepFailed("Tax Report: 'Download data' panel did not open after clicking Download results.")
+
+    # .csv is the default-selected format, but select it explicitly for robustness
+    # against the default ever changing.
+    page.get_by_text(".csv", exact=True).click()
+
+    # "Keep the data formatted" and "Keep the data pivoted" are both checked by
+    # default -- confirmed live -- but check explicitly rather than trust that.
+    checkboxes = page.locator("input[type='checkbox']")
+    for i in range(checkboxes.count()):
+        cb = checkboxes.nth(i)
+        if not cb.is_checked():
+            cb.check()
+
+    period = _previous_month_period(date.today())
+    TAX_REPORT_TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    dest = TAX_REPORT_TARGET_DIR / _tax_report_filename(period)
+
+    # The export can take a while to generate server-side -- Playwright's default
+    # download-wait timeout is only 30s, give it much longer.
+    with page.expect_download(timeout=300000) as download_info:
+        page.get_by_role("button", name="Download", exact=True).click()
+    download = download_info.value
+    download.save_as(str(dest))
+    log.info("Tax Report: saved %s", dest)
+
+
+def step_upload_tax_report_to_drive(ctx: Context) -> None:
+    from googleapiclient.http import MediaFileUpload
+
+    log = ctx.log
+    period = _previous_month_period(date.today())
+    file_path = TAX_REPORT_TARGET_DIR / _tax_report_filename(period)
+    if not file_path.exists():
+        raise StepFailed(
+            f"Expected file not found: {file_path}. Resume from download_tax_report first."
+        )
+
+    if not DRIVE_FOLDER_ID_FILE.exists():
+        raise StepFailed(
+            f"No Drive folder ID configured. Put the target folder's ID (one line) in "
+            f"{DRIVE_FOLDER_ID_FILE}. See docs/google-drive-oauth-setup.md."
+        )
+    folder_id = DRIVE_FOLDER_ID_FILE.read_text().strip()
+
+    service = _drive_service()
+    file_metadata = {"name": file_path.name, "parents": [folder_id]}
+    media = MediaFileUpload(str(file_path), mimetype="text/csv")
+    service.files().create(
+        body=file_metadata, media_body=media, fields="id", supportsAllDrives=True,
+    ).execute()
+    log.info("Uploaded %s to Drive folder %s", file_path.name, folder_id)
+
 
 STEPS = [
     ("micromart_login", step_micromart_login),
+    ("download_tax_report", step_download_tax_report),
+    ("upload_tax_report_to_drive", step_upload_tax_report_to_drive),
 ]
 
 

@@ -16,3 +16,11 @@ exact `read`-based commands that avoid ever typing a password into a chat or she
 with the sibling tool), it will need its own first-time login the first time it runs — expect
 one TOTP consumption for that, and possibly the same headless-login block the sibling tool hit
 in production (see CLAUDE.md) if it ever runs headless before a session is established.
+
+## Google Drive upload
+
+Unlike MicroMart, this is **not** shared with the sibling tool — see
+[`docs/google-drive-oauth-setup.md`](../docs/google-drive-oauth-setup.md) for why (a separate
+OAuth Client keeps the two tools independently revocable). Its refresh token lives under its own
+Keychain entry, `tax-agent-drive-oauth-refresh-token`, written automatically by
+`src/authorize_drive.py` during the one-time consent flow — not something you type in by hand.
