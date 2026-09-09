@@ -374,18 +374,22 @@ def step_micromart_login(ctx: Context) -> None:
 
 
 def step_gtc_login(ctx: Context) -> None:
-    """Logs into the Georgia Tax Center (gtc.dor.ga.gov) -- username/password only,
-    confirmed with the user (no TOTP/SMS/security-question step observed or expected).
+    """Logs into the Georgia Tax Center (gtc.dor.ga.gov) with username/password.
+
+    Confirmed live (2026-09-09, first real attempt): despite no MFA on the user's own
+    regular browser, GTC challenges a new/unrecognized browser profile -- like this
+    tool's dedicated Playwright profile, on its first ever login -- with an *email*
+    security code plus a "Trust this device" checkbox. Not something the user sees
+    day to day since their own browser is already trusted. Handled below by failing
+    clearly with instructions rather than guessing at code retrieval; there's no
+    login automation possible past this until a human completes that challenge once
+    for this profile (see the StepFailed message).
 
     Doesn't reuse `_login_if_needed`: that helper tells logged-in from logged-out by
     URL (MicroMart redirects to a distinct auth.micromart.com fragment when logged
     out), but GTC's login form lives at the same base URL as the authenticated
     dashboard -- there's no URL fragment to key off, so this checks for the Username
-    field disappearing after submit instead. That check, and everything else here,
-    is unverified against a real login -- this is the first attempt, written from
-    the live (logged-out) page structure alone, same as CLAUDE.md's instruction not
-    to guess at behavior that hasn't been observed. Expect this to need adjustment
-    once it's actually run with real credentials."""
+    field disappearing after submit instead."""
     email = get_keychain_secret(KEYCHAIN_GTC_USERNAME, setup_hint="config/keychain-setup.md")
     password = get_keychain_secret(KEYCHAIN_GTC_PASSWORD, setup_hint="config/keychain-setup.md")
     log = ctx.log
@@ -418,6 +422,19 @@ def step_gtc_login(ctx: Context) -> None:
     _wait_settled(page)
     page.wait_for_timeout(1500)
     page.screenshot(path=str(DEBUG_DIR / "gtc-after-submit.png"))
+
+    if page.get_by_text(re.compile("verify security code", re.I)).count() > 0:
+        raise StepFailed(
+            "GTC: hit the 'Verify Security Code' email-verification screen -- this browser "
+            "profile (browser-state/gtc-profile/) isn't trusted yet. This can't be completed "
+            "by this script: it needs a human to open the GTC security-code email and type "
+            "the code in manually, once, with 'Trust this device' checked so future "
+            "automated runs skip it. Run this yourself in your own Terminal (a headed "
+            "Playwright browser launched from an agent's shell may not actually show you a "
+            "window, same issue hit with authorize_drive.py):\n\n"
+            "    .venv/bin/python src/manual_gtc_login.py\n\n"
+            "Then resume with: --resume-from gtc_login"
+        )
 
     if page.get_by_placeholder("Username").count() > 0:
         raise StepFailed(
