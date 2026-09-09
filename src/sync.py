@@ -7,13 +7,17 @@ escalation) with the sibling MicroMart -> VendSoft Sales Reconciliation Agent to
 extracted verbatim since both automate logging into the same MicroMart account. See
 CLAUDE.md for the full story. After login, downloads the previous month's Tax
 Report ("Tax Breakdown" pivot export) from MicroMart Analytics, saves it under
-~/Desktop/Access-Amenities/Financials/Monthly-Sales-and-Use-Tax, and uploads it to
-the same folder in Google Drive.
+~/Desktop/Access-Amenities/Financials/Monthly-Sales-and-Use-Tax, sums Sales
+(pre-tax)/Tax Collected/Total (tax included) per Tax Region into a separate
+totals file (the figures that get filed and paid to each state monthly --
+filing/payment itself is a future step, not built here), and uploads the
+downloaded report to the same folder in Google Drive.
 
 Manual run:       .venv/bin/python src/sync.py
 Resume a step:    .venv/bin/python src/sync.py --resume-from download_tax_report
 """
 import argparse
+import csv
 import logging
 import os
 import re
@@ -386,6 +390,10 @@ def _tax_report_filename(period: date) -> str:
     return f"tax-report-summary-{period.strftime('%m-%Y')}.csv"
 
 
+def _tax_region_totals_filename(period: date) -> str:
+    return f"tax-region-totals-{period.strftime('%m-%Y')}.csv"
+
+
 def step_download_tax_report(ctx: Context) -> None:
     page = ctx.micromart_page()
     log = ctx.log
@@ -505,6 +513,51 @@ def step_download_tax_report(ctx: Context) -> None:
     log.info("Tax Report: saved %s", dest)
 
 
+def _parse_amount(value: str) -> float:
+    return float(value.replace(",", "").replace("$", ""))
+
+
+def step_summarize_tax_by_region(ctx: Context) -> None:
+    """Sums Sales (pre-tax), Tax Collected, and Total (tax included) per Tax
+    Region -- currently a single Georgia region, but the export can carry
+    multiple Tax Regions (and multiple Store/Product Tax Group rows per
+    region) once more locations are added, and each region's totals are
+    what eventually gets filed and paid separately. Filing/payment itself
+    is a future step -- this just produces the per-region figures."""
+    log = ctx.log
+    period = _previous_month_period(date.today())
+    source_path = TAX_REPORT_TARGET_DIR / _tax_report_filename(period)
+    if not source_path.exists():
+        raise StepFailed(
+            f"Expected file not found: {source_path}. Resume from download_tax_report first."
+        )
+
+    totals = {}
+    region_order = []
+    with open(source_path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            region = row["Tax Region"]
+            if region not in totals:
+                totals[region] = {"sales": 0.0, "tax_collected": 0.0, "total": 0.0}
+                region_order.append(region)
+            totals[region]["sales"] += _parse_amount(row["Sales (pre-tax)"])
+            totals[region]["tax_collected"] += _parse_amount(row["Tax Collected"])
+            totals[region]["total"] += _parse_amount(row["Total (tax included)"])
+
+    dest = TAX_REPORT_TARGET_DIR / _tax_region_totals_filename(period)
+    with open(dest, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Tax Region", "Sales (pre-tax)", "Tax Collected", "Total (tax included)"])
+        for region in region_order:
+            t = totals[region]
+            writer.writerow([region, f"{t['sales']:.2f}", f"{t['tax_collected']:.2f}", f"{t['total']:.2f}"])
+            log.info(
+                "Tax Region totals -- %s: sales=%.2f tax_collected=%.2f total=%.2f",
+                region, t["sales"], t["tax_collected"], t["total"],
+            )
+    log.info("Saved tax region totals to %s", dest)
+
+
 def step_upload_tax_report_to_drive(ctx: Context) -> None:
     from googleapiclient.http import MediaFileUpload
 
@@ -535,6 +588,7 @@ def step_upload_tax_report_to_drive(ctx: Context) -> None:
 STEPS = [
     ("micromart_login", step_micromart_login),
     ("download_tax_report", step_download_tax_report),
+    ("summarize_tax_by_region", step_summarize_tax_by_region),
     ("upload_tax_report_to_drive", step_upload_tax_report_to_drive),
 ]
 
