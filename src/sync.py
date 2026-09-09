@@ -43,6 +43,10 @@ MICROMART_DASHBOARD = f"{MICROMART_BASE}/dashboard"
 MICROMART_TAX_REPORT = f"{MICROMART_BASE}/dashboard/analytics/tax-report"
 MICROMART_LOGIN_FRAGMENT = "auth.micromart.com"
 
+GTC_BASE = "https://gtc.dor.ga.gov/_/"
+KEYCHAIN_GTC_USERNAME = "gtc-dor-ga-username"
+KEYCHAIN_GTC_PASSWORD = "gtc-dor-ga"
+
 TAX_REPORT_TARGET_DIR = Path.home() / "Desktop" / "Access-Amenities" / "Financials" / "Monthly-Sales-and-Use-Tax"
 DRIVE_FOLDER_ID_FILE = ROOT / "config" / "drive-folder-id.txt"
 DRIVE_OAUTH_CLIENT_FILE = ROOT / "config" / "oauth-client.json"
@@ -146,6 +150,7 @@ class Context:
         self.log = log
         self._playwright = None
         self._micromart_ctx = None
+        self._gtc_ctx = None
 
     def _pw(self):
         if self._playwright is None:
@@ -174,11 +179,14 @@ class Context:
     def micromart_page(self, force_headed: bool = False):
         return self._persistent_page("_micromart_ctx", "micromart-profile", force_headed)
 
+    def gtc_page(self, force_headed: bool = False):
+        return self._persistent_page("_gtc_ctx", "gtc-profile", force_headed)
+
     def screenshot_all(self, tag: str) -> list:
         """Screenshot whichever browser page(s) are currently open, for failure diagnostics."""
         paths = []
         DEBUG_DIR.mkdir(exist_ok=True)
-        for label, browser_ctx in (("micromart", self._micromart_ctx),):
+        for label, browser_ctx in (("micromart", self._micromart_ctx), ("gtc", self._gtc_ctx)):
             if browser_ctx is None:
                 continue
             try:
@@ -196,6 +204,11 @@ class Context:
         if self._micromart_ctx is not None:
             try:
                 self._micromart_ctx.close()
+            except Exception:
+                pass
+        if self._gtc_ctx is not None:
+            try:
+                self._gtc_ctx.close()
             except Exception:
                 pass
         if self._playwright is not None:
@@ -358,6 +371,63 @@ def step_micromart_login(ctx: Context) -> None:
         submit_name="sign in",
         totp_keychain_service="micromart-platform-totp-secret",
     )
+
+
+def step_gtc_login(ctx: Context) -> None:
+    """Logs into the Georgia Tax Center (gtc.dor.ga.gov) -- username/password only,
+    confirmed with the user (no TOTP/SMS/security-question step observed or expected).
+
+    Doesn't reuse `_login_if_needed`: that helper tells logged-in from logged-out by
+    URL (MicroMart redirects to a distinct auth.micromart.com fragment when logged
+    out), but GTC's login form lives at the same base URL as the authenticated
+    dashboard -- there's no URL fragment to key off, so this checks for the Username
+    field disappearing after submit instead. That check, and everything else here,
+    is unverified against a real login -- this is the first attempt, written from
+    the live (logged-out) page structure alone, same as CLAUDE.md's instruction not
+    to guess at behavior that hasn't been observed. Expect this to need adjustment
+    once it's actually run with real credentials."""
+    email = get_keychain_secret(KEYCHAIN_GTC_USERNAME, setup_hint="config/keychain-setup.md")
+    password = get_keychain_secret(KEYCHAIN_GTC_PASSWORD, setup_hint="config/keychain-setup.md")
+    log = ctx.log
+
+    page = ctx.gtc_page()
+    _goto(page, GTC_BASE)
+    _wait_settled(page)
+
+    username_field = page.get_by_placeholder("Username")
+    if username_field.count() == 0:
+        log.info("GTC: no Username field found -- assuming already logged in (session reused)")
+        return
+
+    # Refuse to proceed past a CAPTCHA rather than attempt to solve or bypass it.
+    if page.locator("iframe[title*='recaptcha' i], iframe[src*='recaptcha' i], [class*='captcha' i]").count() > 0:
+        raise StepFailed(
+            "GTC: a CAPTCHA is present on the login page. This tool will not attempt to "
+            "solve or bypass it -- log in manually once in the browser this script "
+            "controls (profile under browser-state/gtc-profile/), then re-run."
+        )
+
+    DEBUG_DIR.mkdir(exist_ok=True)
+    page.screenshot(path=str(DEBUG_DIR / "gtc-before-fill.png"))
+
+    username_field.fill(email)
+    page.get_by_placeholder("Password").fill(password)
+    page.screenshot(path=str(DEBUG_DIR / "gtc-filled.png"))
+
+    page.get_by_role("button", name=re.compile("log in", re.I)).click()
+    _wait_settled(page)
+    page.wait_for_timeout(1500)
+    page.screenshot(path=str(DEBUG_DIR / "gtc-after-submit.png"))
+
+    if page.get_by_placeholder("Username").count() > 0:
+        raise StepFailed(
+            "GTC: still shows the login form after submitting -- see "
+            "debug-screenshots/gtc-after-submit.png. Could be wrong credentials, an "
+            "unexpected verification step, or a login-detection bug (this check is "
+            "unverified -- see this function's docstring). Fix the issue, then resume "
+            "with: --resume-from gtc_login"
+        )
+    log.info("GTC: login succeeded")
 
 
 def _dismiss_hubspot_popup(page, log: logging.Logger) -> None:
@@ -657,6 +727,7 @@ STEPS = [
     ("download_tax_report", step_download_tax_report),
     ("summarize_tax_by_region", step_summarize_tax_by_region),
     ("upload_tax_report_to_drive", step_upload_tax_report_to_drive),
+    ("gtc_login", step_gtc_login),
 ]
 
 
