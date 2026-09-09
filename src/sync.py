@@ -390,47 +390,75 @@ def step_download_tax_report(ctx: Context) -> None:
     page = ctx.micromart_page()
     log = ctx.log
 
-    _goto(page, MICROMART_TAX_REPORT)
-    page.wait_for_selector("button[aria-label='Date']", timeout=90000, state="visible")
-    _dismiss_hubspot_popup(page, log)
+    CHART_ERROR_TEXT = "There was a problem displaying this chart"
+    MAX_ATTEMPTS = 3
+    pivot = None
+    dashcard = None
+    success = False
 
-    # The default filter on page load is "Previous 30 days or today" -- clear it
-    # first so the Date button reopens the full preset menu (Today/.../Previous
-    # month/...) rather than the narrower relative-range editor for the current
-    # filter type. Confirmed live: skipping the clear opens the wrong picker.
-    filters = page.get_by_test_id("fixed-width-filters")
-    clear_btn = filters.get_by_role("button", name="Clear")
-    if clear_btn.count() > 0:
-        clear_btn.first.click()
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # A fresh navigation each attempt doubles as the "reload and retry" that
+        # a stuck or errored chart needs -- confirmed live: the analytics query
+        # can either hang indefinitely or fail outright with "There was a
+        # problem displaying this chart," and a plain reload clears both.
+        _goto(page, MICROMART_TAX_REPORT)
+        page.wait_for_selector("button[aria-label='Date']", timeout=90000, state="visible")
+        _dismiss_hubspot_popup(page, log)
+
+        # Confirmed live: a stale filter (e.g. "Product Tax Group") can persist
+        # on this dashboard across runs on the same profile and silently scope
+        # the export wrong -- clear every active filter chip, not just Date.
+        filters = page.get_by_test_id("fixed-width-filters")
+        for _ in range(6):
+            clear_btn = filters.get_by_role("button", name="Clear")
+            if clear_btn.count() == 0:
+                break
+            clear_btn.first.click()
+            page.wait_for_timeout(400)
+
+        # With every filter cleared, the Date button reopens the full preset
+        # menu (Today/.../Previous month/...) rather than a relative-range
+        # editor for whatever filter type was previously active.
+        date_btn = filters.get_by_role("button", name="Date")
+        date_btn.click()
         page.wait_for_timeout(500)
+        controls_id = date_btn.get_attribute("aria-controls")
+        if not controls_id:
+            raise StepFailed("Tax Report: date filter dropdown did not open as expected.")
+        page.locator(f"#{controls_id}").get_by_text("Previous month", exact=True).first.click()
+        log.info("Tax Report: date filter set to Previous month (attempt %d/%d)", attempt, MAX_ATTEMPTS)
 
-    date_btn = filters.get_by_role("button", name="Date")
-    date_btn.click()
-    page.wait_for_timeout(500)
-    controls_id = date_btn.get_attribute("aria-controls")
-    if not controls_id:
-        raise StepFailed("Tax Report: date filter dropdown did not open as expected.")
-    page.locator(f"#{controls_id}").get_by_text("Previous month", exact=True).first.click()
-    log.info("Tax Report: date filter set to Previous month")
+        pivot = page.locator("[data-testid='visualization-root'][data-viz-ui-name='Pivot Table']")
+        try:
+            pivot.wait_for(state="visible", timeout=90000)
+        except PlaywrightTimeoutError:
+            raise StepFailed("Tax Report: the Tax Breakdown pivot table card never appeared.")
+        dashcard = page.locator("[data-testid='dashcard']").filter(has=pivot)
+        dashcard.scroll_into_view_if_needed()
 
-    pivot = page.locator("[data-testid='visualization-root'][data-viz-ui-name='Pivot Table']")
-    try:
-        pivot.wait_for(state="visible", timeout=90000)
-    except PlaywrightTimeoutError:
-        raise StepFailed("Tax Report: the Tax Breakdown pivot table card never appeared.")
-    dashcard = page.locator("[data-testid='dashcard']").filter(has=pivot)
-    dashcard.scroll_into_view_if_needed()
+        # The underlying analytics query is slow and varies a lot -- confirmed
+        # live anywhere from ~15s to several minutes for the same report, and
+        # it can also fail outright rather than just being slow. Poll for
+        # either real content or the error state rather than a fixed sleep.
+        log.info("Tax Report: waiting for Tax Breakdown data to finish loading (up to 5 min)...")
+        errored = False
+        for _ in range(150):
+            text = pivot.inner_text()
+            if CHART_ERROR_TEXT in text:
+                errored = True
+                break
+            if "%" in text and len(text) > 50:
+                success = True
+                break
+            page.wait_for_timeout(2000)
 
-    # The underlying analytics query is slow and varies a lot -- confirmed live
-    # anywhere from ~15s to ~3min for the same report. Poll for real content
-    # rather than a fixed sleep.
-    log.info("Tax Report: waiting for Tax Breakdown data to finish loading (up to 5 min)...")
-    for _ in range(150):
-        if "%" in pivot.inner_text() and len(pivot.inner_text()) > 50:
+        if success:
             break
-        page.wait_for_timeout(2000)
-    else:
-        raise StepFailed("Tax Report: Tax Breakdown data never finished loading after 5 minutes.")
+        reason = "the chart failed to display" if errored else "it never finished loading within 5 minutes"
+        log.warning("Tax Report: Tax Breakdown data failed (%s) -- attempt %d/%d", reason, attempt, MAX_ATTEMPTS)
+
+    if not success:
+        raise StepFailed("Tax Report: Tax Breakdown data failed to load after repeated attempts.")
 
     DEBUG_DIR.mkdir(exist_ok=True)
     page.screenshot(path=str(DEBUG_DIR / "tax-report-breakdown-loaded.png"))
