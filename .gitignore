@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.csv
+*credentials*.json
+*service-account*.json
+*oauth-client*.json
+*client_secret*.json
+config/*token*.json
+logs/*.log
+browser-state/
+debug-screenshots/
+.DS_Store
