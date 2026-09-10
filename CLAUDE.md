@@ -87,7 +87,7 @@ came from real production incidents, not upfront design:
 - Credentials live only in macOS Keychain — see `config/keychain-setup.md`. Never in code, chat,
   or shell history. Same for Google OAuth: `config/oauth-client.json` identifies the app,
   `authorize_drive.py` is the one-time consent flow, the resulting refresh token goes to
-  Keychain — see `docs/google-drive-oauth-setup.md`.
+  Keychain — see `docs/google-oauth-setup.md`.
 
 ## GTC surprises (confirmed live, not guessed)
 
@@ -98,19 +98,24 @@ came from real production incidents, not upfront design:
   false-positived on this screen (it checked for the Username field disappearing, which is also
   true on the security-code screen) — fixed to detect the screen by name and fail with clear
   instructions instead of silently reporting success.
-- **This can't be solved by the script itself** — it needs a human to read an email and type a
-  code in. `src/manual_gtc_login.py` exists for exactly this: run it directly (not through an
-  agent's shell — a headed Playwright browser launched from a sandboxed agent shell may not
-  actually display a window on screen, confirmed with both this and the Drive OAuth consent
-  step) so a real window opens, log in, enter the code, check "Trust this device". Once done,
-  it's a one-time cost per machine/profile — the trust persists in `browser-state/gtc-profile/`
-  (gitignored, so a fresh clone or a wiped profile will need this again).
-- If asked to make this fully unattended (e.g. reading the code from Gmail automatically, or
-  reusing the user's real Chrome profile so it's already trusted), treat that as a real decision
-  to make with the user, not something to build speculatively — there are real trade-offs either
-  way (a new Gmail scope and inbox-parsing logic vs. coupling this automation to the user's
-  personal daily-use browser profile, which risks corrupting or being corrupted by their normal
-  browsing). Ask first.
+- **Now handled fully automatically** via `_fetch_gtc_security_code`: it reads the code straight
+  out of the `info@accessamenities.com` Gmail inbox (read-only `gmail.readonly` scope, added to
+  the same OAuth client as Drive/Sheets — only ever used to search for one specific email,
+  `from:NoReply@dor.ga.gov subject:"Georgia Tax Center Security Code"`, filtered to after the
+  login attempt started so a stale code from an older session is never picked up) and checks
+  "Trust this device" automatically. Verified live against a genuinely fresh, never-logged-in
+  browser profile — no human involved, and a second run against that same now-trusted profile
+  skipped the challenge entirely, confirming the trust persists.
+- **The user explicitly considered and declined reusing their real Chrome profile** for this
+  instead (which would make GTC see an already-trusted device from the start) — rejected because
+  it would need their everyday Chrome fully closed every time the automation runs, and it
+  couples this tool's automation to their personal daily-use browser in a way the rest of this
+  project deliberately avoids (see the per-site isolated `browser-state/` profiles above). If
+  ever revisited, treat it as a real decision to re-raise with the user, not something to build
+  speculatively.
+- `src/manual_gtc_login.py` still exists as the fallback if the automated email-code fetch ever
+  times out (e.g. Gmail access itself is broken, or the email is delayed) — see its
+  `StepFailed` message.
 
 ## Adding the next step
 

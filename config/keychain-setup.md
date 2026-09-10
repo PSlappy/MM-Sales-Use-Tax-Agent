@@ -20,16 +20,16 @@ in production (see CLAUDE.md) if it ever runs headless before a session is estab
 ## Google Drive upload
 
 Unlike MicroMart, this is **not** shared with the sibling tool — see
-[`docs/google-drive-oauth-setup.md`](../docs/google-drive-oauth-setup.md) for why (a separate
+[`docs/google-oauth-setup.md`](../docs/google-oauth-setup.md) for why (a separate
 OAuth Client keeps the two tools independently revocable). Its refresh token lives under its own
 Keychain entry, `tax-agent-drive-oauth-refresh-token`, written automatically by
 `src/authorize_drive.py` during the one-time consent flow — not something you type in by hand.
 
 ## Georgia Tax Center (gtc.dor.ga.gov)
 
-Username + password only — confirmed no MFA/security-question step. Run these yourself in
-Terminal (same `read`-based pattern as MicroMart's setup above — nothing ever passes through
-chat or shell history):
+Username + password only day to day — no MFA on a browser GTC already recognizes. Run these
+yourself in Terminal (same `read`-based pattern as MicroMart's setup above — nothing ever
+passes through chat or shell history):
 
 ```bash
 printf "GTC username: " && read -rs PW && echo && security add-generic-password -a "$USER" -s "gtc-dor-ga-username" -w "$PW" -U && unset PW
@@ -39,5 +39,8 @@ printf "GTC username: " && read -rs PW && echo && security add-generic-password 
 printf "GTC password: " && read -rs PW && echo && security add-generic-password -a "$USER" -s "gtc-dor-ga" -w "$PW" -U && unset PW
 ```
 
-`step_gtc_login` in `src/sync.py` reads these two entries. It's untested against a real login
-(see the docstring on that function) — expect to iterate on it once it's actually run.
+`step_gtc_login` in `src/sync.py` reads these two entries. A brand-new browser profile (like
+this tool's dedicated one, on its first-ever login) does get an emailed device-verification
+code, confirmed live — handled automatically by reading that email via the Gmail access set up
+in the Google OAuth step above, no separate credential needed for it. See the "GTC surprises"
+note in `CLAUDE.md` for the full story.

@@ -57,9 +57,13 @@ submit? both?). That's the next real conversation, not something to guess at.
   The Georgia Tax Center challenged this tool's dedicated browser profile with an emailed
   security code on its very first login — even though the same account shows no such challenge
   in a normal, already-trusted browser. First version of the login-success check didn't know
-  that screen existed and reported success anyway, which was wrong. Fixed to recognize that
-  screen by name and fail loudly with instructions instead of a false positive. Once a human
-  completes it once (checking "Trust this device"), it doesn't come back for that machine.
+  that screen existed and reported success anyway, which was wrong. Fixed twice: first to
+  recognize the screen and fail loudly instead of a false positive, then to actually get past it
+  — the code reads the security code straight out of the Gmail inbox it just got emailed to
+  (read-only access, and it only ever looks for that one specific email) and checks "Trust this
+  device" itself, so a brand-new machine doesn't need a human at all, not even once. A manual
+  fallback (`src/manual_gtc_login.py`) still exists in case the automated email lookup ever
+  times out.
 - **Deterministic pipeline, not an AI agent driving the browser live.** The actual clicking,
   filling, and file handling is a plain [Playwright](https://playwright.dev/python/) script,
   same as the sibling tool — repeatable, fast, and auditable. An AI agent was used to build and
@@ -79,6 +83,8 @@ submit? both?). That's the next real conversation, not something to guess at.
   (shared login logic with the sibling tool)
 - **Google Drive API + Google Sheets API** (OAuth, scoped to `drive.file` + `spreadsheets`) —
   uploading the monthly report as a formula-driven spreadsheet
+- **Gmail API** (OAuth, read-only) — reading the Georgia Tax Center's device-verification
+  security code so a brand-new machine doesn't need a human to complete that step by hand
 - **macOS Keychain** — credential storage
 
 ## How it runs, today
@@ -99,13 +105,15 @@ pattern this will likely follow once it's ready.
 1. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/playwright install chromium`
 2. Store MicroMart and Georgia Tax Center credentials in Keychain — see
    [`config/keychain-setup.md`](config/keychain-setup.md).
-3. Set up Google OAuth (Drive + Sheets) — see
-   [`docs/google-drive-oauth-setup.md`](docs/google-drive-oauth-setup.md), then run
+3. Set up Google OAuth (Drive + Sheets + read-only Gmail) — see
+   [`docs/google-oauth-setup.md`](docs/google-oauth-setup.md), then run
    `.venv/bin/python src/authorize_drive.py` once for the interactive consent.
 4. Create `config/drive-folder-id.txt` (the target Drive folder's ID) — see the adjacent
    `.example.txt` file. Gitignored since it's environment-specific, not code.
-5. First Georgia Tax Center login on a new machine needs one manual step — see
-   `src/manual_gtc_login.py` and the "GTC surprises" note in `CLAUDE.md`.
+
+A first-ever Georgia Tax Center login on a new machine should complete on its own (the security
+code gets read straight from Gmail) — `src/manual_gtc_login.py` is only needed as a fallback if
+that ever times out.
 
 ## Files
 
