@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-time interactive Google OAuth consent for Drive + Sheets access.
+One-time interactive Google OAuth consent for Drive + Sheets + Gmail read access.
 
 Run this once (and again any time scopes change, or if the refresh token is
 ever revoked):
@@ -11,12 +11,14 @@ Opens a browser window. Sign in as info@accessamenities.com and approve
 access. The resulting refresh token is stored in Keychain -- the sync script
 reads it from there and never needs the browser again.
 
-Needs both drive.file (create/place the file in the target Drive folder) and
-spreadsheets (write the "Tax-Region-Totals" formula tab via the Sheets API)
--- drive.file alone doesn't cover Sheets API calls even on files this app
-created itself.
+Needs drive.file (create/place the file in the target Drive folder),
+spreadsheets (write the "Tax-Region-Totals" formula tab via the Sheets API --
+drive.file alone doesn't cover Sheets API calls even on files this app
+created itself), and gmail.readonly (read the Georgia Tax Center's emailed
+security code so a new/untrusted browser profile's first login doesn't need a
+human -- read-only, and only ever used to search for that one specific email).
 
-See docs/google-drive-oauth-setup.md for how config/oauth-client.json is
+See docs/google-oauth-setup.md for how config/oauth-client.json is
 obtained (a separate OAuth Client from the sibling micromart-vendsoft-sync
 tool, in the same Google Cloud project).
 """
@@ -31,6 +33,7 @@ CLIENT_SECRETS_FILE = ROOT / "config" / "oauth-client.json"
 SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 KEYCHAIN_SERVICE = "tax-agent-drive-oauth-refresh-token"
 
@@ -46,7 +49,7 @@ def store_in_keychain(token: str) -> None:
 
 def main() -> None:
     if not CLIENT_SECRETS_FILE.exists():
-        print(f"Missing {CLIENT_SECRETS_FILE} -- see docs/google-drive-oauth-setup.md", file=sys.stderr)
+        print(f"Missing {CLIENT_SECRETS_FILE} -- see docs/google-oauth-setup.md", file=sys.stderr)
         sys.exit(1)
 
     flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS_FILE), SCOPES)

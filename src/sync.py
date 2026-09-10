@@ -50,12 +50,14 @@ KEYCHAIN_GTC_PASSWORD = "gtc-dor-ga"
 TAX_REPORT_TARGET_DIR = Path.home() / "Desktop" / "Access-Amenities" / "Financials" / "Monthly-Sales-and-Use-Tax"
 DRIVE_FOLDER_ID_FILE = ROOT / "config" / "drive-folder-id.txt"
 DRIVE_OAUTH_CLIENT_FILE = ROOT / "config" / "oauth-client.json"
-DRIVE_SCOPES = [
+GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 TAX_REGION_TOTALS_SHEET_TITLE = "Tax-Region-Totals"
 KEYCHAIN_DRIVE_REFRESH = "tax-agent-drive-oauth-refresh-token"
+GTC_SECURITY_CODE_SENDER = "NoReply@dor.ga.gov"
 
 MAX_LOGIN_ATTEMPTS = 2  # capped low deliberately -- avoid tripping account lockouts
 
@@ -117,7 +119,7 @@ def _google_creds():
 
     if not DRIVE_OAUTH_CLIENT_FILE.exists():
         raise StepFailed(
-            f"Missing {DRIVE_OAUTH_CLIENT_FILE}. See docs/google-drive-oauth-setup.md."
+            f"Missing {DRIVE_OAUTH_CLIENT_FILE}. See docs/google-oauth-setup.md."
         )
     client_config = json.loads(DRIVE_OAUTH_CLIENT_FILE.read_text())["installed"]
     refresh_token = get_keychain_secret(
@@ -129,7 +131,7 @@ def _google_creds():
         token_uri=client_config["token_uri"],
         client_id=client_config["client_id"],
         client_secret=client_config["client_secret"],
-        scopes=DRIVE_SCOPES,
+        scopes=GOOGLE_SCOPES,
     )
 
 
@@ -143,6 +145,12 @@ def _sheets_service():
     from googleapiclient.discovery import build
 
     return build("sheets", "v4", credentials=_google_creds())
+
+
+def _gmail_service():
+    from googleapiclient.discovery import build
+
+    return build("gmail", "v1", credentials=_google_creds())
 
 
 class Context:
@@ -373,6 +381,38 @@ def step_micromart_login(ctx: Context) -> None:
     )
 
 
+def _fetch_gtc_security_code(log: logging.Logger, after_ts: int, timeout_seconds: int = 90) -> str:
+    """Polls Gmail (read-only) for the Georgia Tax Center's emailed device-trust
+    security code, sent no earlier than `after_ts` (a Unix timestamp) so a stale
+    code from an older session is never picked up by mistake. Confirmed live: the
+    email arrives within a few seconds of submitting the login form, from
+    NoReply@dor.ga.gov, subject "Georgia Tax Center Security Code", body reading
+    "NNNNNN is your security code"."""
+    gmail = _gmail_service()
+    query = (
+        f'from:{GTC_SECURITY_CODE_SENDER} subject:"Georgia Tax Center Security Code" '
+        f"after:{after_ts - 120}"
+    )
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        result = gmail.users().messages().list(userId="me", q=query, maxResults=5).execute()
+        for msg_ref in result.get("messages", []):
+            msg = gmail.users().messages().get(userId="me", id=msg_ref["id"]).execute()
+            if int(msg["internalDate"]) // 1000 < after_ts - 30:
+                continue
+            match = re.search(r"(\d{6}) is your security code", msg.get("snippet", ""))
+            if match:
+                log.info("GTC: retrieved security code from the email Georgia Tax Center just sent")
+                return match.group(1)
+        time.sleep(3)
+    raise StepFailed(
+        f"GTC: no security-code email showed up from {GTC_SECURITY_CODE_SENDER} within "
+        f"{timeout_seconds}s of logging in. Complete it manually this once instead:\n\n"
+        "    .venv/bin/python src/manual_gtc_login.py\n\n"
+        "Then resume with: --resume-from gtc_login"
+    )
+
+
 def step_gtc_login(ctx: Context) -> None:
     """Logs into the Georgia Tax Center (gtc.dor.ga.gov) with username/password.
 
@@ -380,10 +420,14 @@ def step_gtc_login(ctx: Context) -> None:
     regular browser, GTC challenges a new/unrecognized browser profile -- like this
     tool's dedicated Playwright profile, on its first ever login -- with an *email*
     security code plus a "Trust this device" checkbox. Not something the user sees
-    day to day since their own browser is already trusted. Handled below by failing
-    clearly with instructions rather than guessing at code retrieval; there's no
-    login automation possible past this until a human completes that challenge once
-    for this profile (see the StepFailed message).
+    day to day since their own browser is already trusted.
+
+    Handled fully automatically: the code is read straight out of the
+    info@accessamenities.com Gmail inbox (read-only Gmail access, only ever used to
+    search for this one specific email) and "Trust this device" is checked so this
+    only ever happens once per browser profile. If the email never arrives, this
+    falls back to the same manual, one-time instructions as before
+    (src/manual_gtc_login.py) rather than hanging indefinitely.
 
     Doesn't reuse `_login_if_needed`: that helper tells logged-in from logged-out by
     URL (MicroMart redirects to a distinct auth.micromart.com fragment when logged
@@ -418,23 +462,27 @@ def step_gtc_login(ctx: Context) -> None:
     page.get_by_placeholder("Password").fill(password)
     page.screenshot(path=str(DEBUG_DIR / "gtc-filled.png"))
 
+    login_attempt_ts = int(time.time())
     page.get_by_role("button", name=re.compile("log in", re.I)).click()
     _wait_settled(page)
     page.wait_for_timeout(1500)
     page.screenshot(path=str(DEBUG_DIR / "gtc-after-submit.png"))
 
     if page.get_by_text(re.compile("verify security code", re.I)).count() > 0:
-        raise StepFailed(
-            "GTC: hit the 'Verify Security Code' email-verification screen -- this browser "
-            "profile (browser-state/gtc-profile/) isn't trusted yet. This can't be completed "
-            "by this script: it needs a human to open the GTC security-code email and type "
-            "the code in manually, once, with 'Trust this device' checked so future "
-            "automated runs skip it. Run this yourself in your own Terminal (a headed "
-            "Playwright browser launched from an agent's shell may not actually show you a "
-            "window, same issue hit with authorize_drive.py):\n\n"
-            "    .venv/bin/python src/manual_gtc_login.py\n\n"
-            "Then resume with: --resume-from gtc_login"
-        )
+        log.info("GTC: hit the email security-code screen -- this browser profile isn't "
+                  "trusted yet, fetching the code from Gmail")
+        code = _fetch_gtc_security_code(log, after_ts=login_attempt_ts)
+        page.get_by_placeholder("Required").fill(code)
+
+        trust_checkbox = page.locator("input[type='checkbox']")
+        if trust_checkbox.count() > 0 and not trust_checkbox.first.is_checked():
+            trust_checkbox.first.check()
+
+        page.screenshot(path=str(DEBUG_DIR / "gtc-code-filled.png"))
+        page.get_by_role("button", name="Confirm", exact=True).click()
+        _wait_settled(page)
+        page.wait_for_timeout(1500)
+        page.screenshot(path=str(DEBUG_DIR / "gtc-after-code-confirm.png"))
 
     if page.get_by_placeholder("Username").count() > 0:
         raise StepFailed(
@@ -680,7 +728,7 @@ def step_upload_tax_report_to_drive(ctx: Context) -> None:
     if not DRIVE_FOLDER_ID_FILE.exists():
         raise StepFailed(
             f"No Drive folder ID configured. Put the target folder's ID (one line) in "
-            f"{DRIVE_FOLDER_ID_FILE}. See docs/google-drive-oauth-setup.md."
+            f"{DRIVE_FOLDER_ID_FILE}. See docs/google-oauth-setup.md."
         )
     folder_id = DRIVE_FOLDER_ID_FILE.read_text().strip()
 
